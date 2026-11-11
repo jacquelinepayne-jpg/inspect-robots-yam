@@ -82,9 +82,12 @@ class FakeOb:
         self.pipelines: list[FakePipeline] = []
         self.configs: list[FakeConfig] = []
         self.aligns: list[FakeAlign] = []
+        self.contexts: list[FakeContext] = []
 
     def Context(self) -> FakeContext:
-        return FakeContext(self.devices)
+        context = FakeContext(self.devices)
+        self.contexts.append(context)
+        return context
 
     def Pipeline(self, device: FakeDevice) -> FakePipeline:
         pipeline = FakePipeline(device)
@@ -401,6 +404,16 @@ def test_images_depth_and_intrinsics_are_served_for_every_camera() -> None:
         assert config.aggregate == "FULL_FRAME_REQUIRE"
         assert len(config.streams) == 2
     assert all(align.stream == "COLOR_STREAM" for align in ob.aligns)
+
+
+def test_reader_holds_the_sdk_context_while_its_pipelines_run() -> None:
+    camera, ob = reader()
+
+    camera(cfg())
+
+    # A dropped Context frees the SDK device manager (NULL "deviceMgr" on the
+    # next call), so the reader must keep the one it enumerated with.
+    assert camera._context is ob.contexts[-1]
 
 
 def test_depth_uses_each_frames_own_scale() -> None:

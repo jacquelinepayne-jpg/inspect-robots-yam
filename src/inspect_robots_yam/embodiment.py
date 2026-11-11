@@ -1189,6 +1189,8 @@ class _OrbbecCameraReader(_RealsenseCameraReader):
     """
 
     _SDK_NAME: ClassVar[str] = "Orbbec"
+    #: The SDK Context of the current open cycle; it must outlive the pipelines.
+    _context: Any = None
 
     @staticmethod
     def _import_sdk() -> Any:  # pragma: no cover - real pyorbbecsdk
@@ -1204,7 +1206,11 @@ class _OrbbecCameraReader(_RealsenseCameraReader):
         with self._lock:
             self._generation += 1
             generation = self._generation
-        device_list = ob.Context().query_devices()
+        # The Context owns the SDK's device manager. A temporary one is freed at
+        # once, after which device-list and device calls fail with a NULL
+        # "deviceMgr", so the reader holds it for as long as its pipelines run.
+        self._context = ob.Context()
+        device_list = self._context.query_devices()
         visible = {
             str(device_list.get_device_serial_number_by_index(index)): str(
                 device_list.get_device_name_by_index(index)

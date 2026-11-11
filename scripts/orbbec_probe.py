@@ -33,7 +33,10 @@ def main() -> int:
     """Print one block per connected Orbbec device; return 1 when none is found."""
     import pyorbbecsdk as ob  # type: ignore[import-not-found]
 
-    devices = ob.Context().query_devices()
+    # Keep the Context referenced: it owns the device manager, and a temporary
+    # one is freed at once, failing later calls with a NULL "deviceMgr".
+    context = ob.Context()
+    devices = context.query_devices()
     if devices.get_count() == 0:
         print("no Orbbec devices found (check USB, udev rules, and VM passthrough)")
         return 1
