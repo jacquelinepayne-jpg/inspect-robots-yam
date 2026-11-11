@@ -430,7 +430,17 @@ uv pip install --no-deps 'pyorbbecsdk2>=2.1.3'
 (opencv-python, open3d, pygame, pynput, and `numpy<2` on Python 3.11) as
 requirements. A normal install puts a second `cv2` next to this package's
 opencv-python-headless and can downgrade numpy. The binding itself needs only
-numpy. Linux also needs Orbbec's udev rules so the cameras open without root.
+numpy. Linux also needs Orbbec's udev rule so the cameras open without root.
+Without it, enumeration still lists the cameras but with blank serials, and
+opening them fails with `usbEnumerator openUsbDevice failed!`:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2bc5", MODE="0666"' | \
+  sudo tee /etc/udev/rules.d/99-obsensor-libusb.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug and replug the cameras (in a VM, detach and reattach them).
 
 List the connected cameras, their serials, sensors, and offered profiles:
 

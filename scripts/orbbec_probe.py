@@ -85,6 +85,12 @@ def main(argv: list[str] | None = None) -> int:
     # all before opening anything, so a camera that fails to open still shows.
     for serial, name in serials:
         print(f"found {name}  serial={serial}")
+    if any(not serial for serial, _ in serials):
+        print(
+            "WARNING: blank serials mean this user cannot access the cameras over USB. "
+            "Install Orbbec's udev rule (README, Orbbec depth) and replug, or compare "
+            'with: sudo "$(which python)" scripts/orbbec_probe.py'
+        )
     failures = 0
     for serial, name in serials:
         print(f"== {name}  serial={serial}")
