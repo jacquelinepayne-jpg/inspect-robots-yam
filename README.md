@@ -436,9 +436,11 @@ List the connected cameras, their serials, sensors, and offered profiles:
 
 ```bash
 python scripts/orbbec_probe.py
+python scripts/orbbec_probe.py --snap ~/orbbec-snaps   # one <serial>.jpg per camera
 ```
 
-Then give each slot its serial (quote all-digit serials, as for RealSense):
+The snapshots show which serial is the top, left, and right camera. Then give
+each slot its serial (quote all-digit serials, as for RealSense):
 
 ```ini
 top_orbbec_serial = "YOUR-TOP-SERIAL"
@@ -450,8 +452,9 @@ A slot with `*_orbbec_serial` is owned by pyorbbecsdk. Observations carry the
 same keys as a RealSense slot: the colour image in `images`, and
 `extra["{cam}_depth"]` (float32 metres, aligned to that image) plus
 `extra["{cam}_intrinsics"]` (3×3 K at the published size). Depth is aligned to
-the colour sensor in software with the SDK's `AlignFilter`. Colour arriving as
-RGB, BGR, YUYV, UYVY or MJPG is converted to RGB.
+the colour sensor in software with the SDK's `AlignFilter`. The reader requests
+colour as RGB, falling back to BGR, YUYV, then MJPG, and never the Y8/Y16
+greyscale modes a Gemini colour sensor also offers; depth is requested as Y16.
 
 `*_orbbec_serial` is a third source per slot, exclusive with `*_cam_device`
 and `*_depth_serial`, and slots can mix sources. `capture_width` /

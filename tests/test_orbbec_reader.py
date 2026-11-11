@@ -162,13 +162,18 @@ class FakeProfile:
 
 
 class FakeProfileList:
-    def __init__(self, sensor: str, offered: list[tuple[int, int, int]]) -> None:
+    def __init__(
+        self, sensor: str, offered: list[tuple[int, int, int]], formats: frozenset[str]
+    ) -> None:
         self.sensor = sensor
         self._profiles = [FakeProfile(*entry) for entry in offered]
+        self._formats = formats
         self.requests: list[tuple[int, int, Any, int]] = []
 
     def get_video_stream_profile(self, width: int, height: int, fmt: Any, fps: int) -> FakeProfile:
         self.requests.append((width, height, fmt, fps))
+        if fmt not in self._formats:
+            raise RuntimeError("Invalid input, No matched video stream profile found!")
         for profile in self._profiles:
             if (profile.width, profile.height, profile.fps) == (width, height, fps):
                 return profile
@@ -271,12 +276,14 @@ class FakeDevice:
         sensors: list[str] | None = None,
         offered: list[tuple[int, int, int]] | None = None,
         responses: list[Response] | None = None,
+        colour_formats: frozenset[str] = frozenset({"RGB", "Y8", "Y16"}),
     ) -> None:
         self.serial = serial
         self.name = name
         self.sensors = sensors if sensors is not None else ["COLOR_SENSOR", "DEPTH_SENSOR"]
         self.offered = offered if offered is not None else [(640, 480, 30), (*SIZE, 30)]
         self.responses: list[Response] = list(responses or [])
+        self.colour_formats = colour_formats
         self.start_error: BaseException | None = None
         self.stop_error: BaseException | None = None
 
@@ -305,7 +312,8 @@ class FakePipeline:
         self.waits = 0
 
     def get_stream_profile_list(self, sensor: str) -> FakeProfileList:
-        profile_list = FakeProfileList(sensor, self.device.offered)
+        formats = self.device.colour_formats if sensor == "COLOR_SENSOR" else frozenset({"Y16"})
+        profile_list = FakeProfileList(sensor, self.device.offered, formats)
         self.lists[sensor] = profile_list
         return profile_list
 
@@ -441,10 +449,29 @@ def test_profiles_request_configured_sizes_and_fps() -> None:
     camera(cfg())
 
     top, left = ob.pipelines
-    assert top.lists["COLOR_SENSOR"].requests == [(8, 6, "UNKNOWN_FORMAT", 30)]
-    assert top.lists["DEPTH_SENSOR"].requests == [(4, 2, "UNKNOWN_FORMAT", 30)]
-    assert left.lists["COLOR_SENSOR"].requests == [(16, 12, "UNKNOWN_FORMAT", 30)]
-    assert left.lists["DEPTH_SENSOR"].requests == [(4, 2, "UNKNOWN_FORMAT", 30)]
+    assert top.lists["COLOR_SENSOR"].requests == [(8, 6, "RGB", 30)]
+    assert top.lists["DEPTH_SENSOR"].requests == [(4, 2, "Y16", 30)]
+    assert left.lists["COLOR_SENSOR"].requests == [(16, 12, "RGB", 30)]
+    assert left.lists["DEPTH_SENSOR"].requests == [(4, 2, "Y16", 30)]
+
+
+def test_colour_prefers_rgb_then_falls_back_through_bgr_yuyv_mjpg() -> None:
+    device = FakeDevice("OB1", colour_formats=frozenset({"MJPG", "Y8"}))
+    camera, ob = reader(FakeOb([device]), {"top_cam": "OB1"})
+
+    camera(cfg())
+
+    requested = [request[2] for request in ob.pipelines[0].lists["COLOR_SENSOR"].requests]
+    # Greyscale (Y8/Y16) is never requested, even though the sensor offers it.
+    assert requested == ["RGB", "BGR", "YUYV", "MJPG"]
+
+
+def test_greyscale_only_colour_sensor_is_rejected() -> None:
+    device = FakeDevice("OB1", colour_formats=frozenset({"Y8", "Y16"}))
+    camera, _ = reader(FakeOb([device]), {"top_cam": "OB1"})
+
+    with pytest.raises(RuntimeError, match="offers no colour stream at 8x6@30"):
+        camera(cfg())
 
 
 def test_depth_defaults_to_the_colour_size_and_per_camera_depth_override_wins() -> None:
@@ -458,8 +485,8 @@ def test_depth_defaults_to_the_colour_size_and_per_camera_depth_override_wins() 
     camera(cfg())
 
     top, left = ob.pipelines
-    assert top.lists["DEPTH_SENSOR"].requests == [(*SIZE, "UNKNOWN_FORMAT", 30)]
-    assert left.lists["DEPTH_SENSOR"].requests == [(4, 2, "UNKNOWN_FORMAT", 30)]
+    assert top.lists["DEPTH_SENSOR"].requests == [(*SIZE, "Y16", 30)]
+    assert left.lists["DEPTH_SENSOR"].requests == [(4, 2, "Y16", 30)]
 
 
 @pytest.mark.parametrize(

@@ -1264,16 +1264,30 @@ class _OrbbecCameraReader(_RealsenseCameraReader):
         )
 
     def _profile(
-        self, ob: Any, pipeline: Any, sensor: Any, size: tuple[int, int], name: str, kind: str
+        self,
+        ob: Any,
+        pipeline: Any,
+        sensor: Any,
+        formats: tuple[Any, ...],
+        size: tuple[int, int],
+        name: str,
+        kind: str,
     ) -> Any:
-        """Select a ``width x height @ depth_fps`` profile, listing the offered ones on failure."""
+        """Select ``width x height @ depth_fps`` in the first offered of ``formats``.
+
+        The format is never left to the SDK: a Gemini colour sensor also offers
+        Y8/Y16 greyscale at every colour size, and an unconstrained request may
+        return one of those. On failure the offered sizes and rates are listed.
+        """
         profiles = pipeline.get_stream_profile_list(sensor)
         width, height = size
-        try:
-            return profiles.get_video_stream_profile(
-                width, height, ob.OBFormat.UNKNOWN_FORMAT, self._depth_fps
-            )
-        except Exception as exc:
+        failure: Exception | None = None
+        for fmt in formats:
+            try:
+                return profiles.get_video_stream_profile(width, height, fmt, self._depth_fps)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
             offered = sorted(
                 {
                     (profile.get_width(), profile.get_height(), profile.get_fps())
@@ -1287,7 +1301,8 @@ class _OrbbecCameraReader(_RealsenseCameraReader):
             raise RuntimeError(
                 f"Orbbec camera {name} offers no {kind} stream at {width}x{height}@"
                 f"{self._depth_fps}; offered: {listing or 'none'}"
-            ) from exc
+            ) from failure
+        raise ValueError("no stream formats requested")  # pragma: no cover - callers pass some
 
     def _open_one(self, ob: Any, name: str, device: Any, generation: int) -> _OrbbecBundle:
         """Start colour+depth on one device, build the align filter, and seed from warm-up."""
@@ -1297,11 +1312,25 @@ class _OrbbecCameraReader(_RealsenseCameraReader):
         depth_size = self._depth_capture_sizes.get(
             name, self._depth_capture_size or (width, height)
         )
+        # RGB first: the SDK then delivers frames needing no conversion here.
+        colour_formats = (ob.OBFormat.RGB, ob.OBFormat.BGR, ob.OBFormat.YUYV, ob.OBFormat.MJPG)
         colour_profile = self._profile(
-            ob, pipeline, ob.OBSensorType.COLOR_SENSOR, (width, height), name, "colour"
+            ob,
+            pipeline,
+            ob.OBSensorType.COLOR_SENSOR,
+            colour_formats,
+            (width, height),
+            name,
+            "colour",
         )
         depth_profile = self._profile(
-            ob, pipeline, ob.OBSensorType.DEPTH_SENSOR, depth_size, name, "depth"
+            ob,
+            pipeline,
+            ob.OBSensorType.DEPTH_SENSOR,
+            (ob.OBFormat.Y16,),
+            depth_size,
+            name,
+            "depth",
         )
         ob_cfg = ob.Config()
         ob_cfg.enable_stream(colour_profile)

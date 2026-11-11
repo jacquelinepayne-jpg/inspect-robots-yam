@@ -11,10 +11,17 @@ For every device it prints the serial to put in ``{slot}_orbbec_serial``, every
 sensor the device exposes, and the colour and depth profiles it offers. A device
 without a ``COLOR_SENSOR`` (one that exposes only a left/right colour pair) is
 flagged: the builtin reader cannot align depth to it yet.
+
+``--snap DIR`` also saves one colour photo per camera as ``DIR/<serial>.jpg``,
+to tell which serial is the top, left, and right camera:
+
+    python scripts/orbbec_probe.py --snap ~/orbbec-snaps
 """
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 from typing import Any
 
 
@@ -29,9 +36,39 @@ def _profiles(pipeline: Any, sensor: Any) -> list[str]:
     return [f"{w}x{h}@{fps} {fmt}" for w, h, fps, fmt in sorted(entries)]
 
 
-def main() -> int:
+def _snap(ob: Any, device: Any, path: Path) -> None:
+    """Save one 640x480 RGB colour frame from ``device`` as a JPEG at ``path``."""
+    import cv2
+    import numpy as np
+
+    pipeline = ob.Pipeline(device)
+    profiles = pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
+    config = ob.Config()
+    config.enable_stream(profiles.get_video_stream_profile(640, 480, ob.OBFormat.RGB, 30))
+    pipeline.start(config)
+    try:
+        for _ in range(30):  # let auto-exposure settle and skip empty sets
+            frames = pipeline.wait_for_frames(1000)
+            colour = frames.get_color_frame() if frames is not None else None
+        if colour is None:
+            raise RuntimeError("no colour frame within 30 waits")
+        rgb = np.asarray(colour.get_data(), dtype=np.uint8).reshape(
+            colour.get_height(), colour.get_width(), 3
+        )
+        cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    finally:
+        pipeline.stop()
+
+
+def main(argv: list[str] | None = None) -> int:
     """Print every Orbbec device; return 1 when none is found or any fails to open."""
     import pyorbbecsdk as ob  # type: ignore[import-not-found]
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--snap", type=Path, help="save one colour JPEG per camera here")
+    args = parser.parse_args(argv)
+    if args.snap is not None:
+        args.snap.expanduser().mkdir(parents=True, exist_ok=True)
 
     # Keep the Context referenced: it owns the device manager, and a temporary
     # one is freed at once, failing later calls with a NULL "deviceMgr".
@@ -52,7 +89,12 @@ def main() -> int:
     for serial, name in serials:
         print(f"== {name}  serial={serial}")
         try:
-            _describe(ob, devices.get_device_by_serial_number(serial))
+            device = devices.get_device_by_serial_number(serial)
+            _describe(ob, device)
+            if args.snap is not None:
+                path = args.snap.expanduser() / f"{serial}.jpg"
+                _snap(ob, device, path)
+                print(f"   saved {path}")
         except Exception as exc:
             failures += 1
             print(f"   ERROR opening device: {exc}")

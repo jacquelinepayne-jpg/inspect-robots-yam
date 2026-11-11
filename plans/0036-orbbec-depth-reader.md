@@ -1,6 +1,9 @@
 # Orbbec depth reader
 
-Status: implemented, not yet verified on hardware.
+Status: implemented. Enumeration and profiles verified on three Gemini 305s
+(every unit exposes `COLOR_SENSOR`, `DEPTH_SENSOR`, `LEFT_IR_SENSOR`,
+`RIGHT_IR_SENSOR`, with colour and depth both at 640x480@30); streaming in an
+eval not yet verified.
 
 ## Problem
 
@@ -46,7 +49,9 @@ subclass replaces only:
 - `_open_all`: enumerate with `Context().query_devices()`, match serials,
   list visible `name / serial` pairs when one is missing, all-or-nothing open.
 - `_open_one`: require a `COLOR_SENSOR`, select colour and depth profiles at
-  the configured size and `depth_fps` (listing offered profiles on failure),
+  the configured size and `depth_fps` in explicit formats (colour RGB, then
+  BGR, YUYV, MJPG; depth Y16), since the Gemini colour sensor also offers
+  Y8/Y16 greyscale at every size (listing offered profiles on failure),
   start with `FULL_FRAME_REQUIRE` aggregation, read K from the colour profile,
   build `AlignFilter(COLOR_STREAM)`, warm up for ten waits.
 - `_drain` / `_publish_set`: `wait_for_frames(1000)`, align, take colour and
