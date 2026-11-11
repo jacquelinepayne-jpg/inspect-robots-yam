@@ -30,7 +30,7 @@ def _profiles(pipeline: Any, sensor: Any) -> list[str]:
 
 
 def main() -> int:
-    """Print one block per connected Orbbec device; return 1 when none is found."""
+    """Print every Orbbec device; return 1 when none is found or any fails to open."""
     import pyorbbecsdk as ob  # type: ignore[import-not-found]
 
     # Keep the Context referenced: it owns the device manager, and a temporary
@@ -40,27 +40,46 @@ def main() -> int:
     if devices.get_count() == 0:
         print("no Orbbec devices found (check USB, udev rules, and VM passthrough)")
         return 1
-    for index in range(devices.get_count()):
-        serial = devices.get_device_serial_number_by_index(index)
-        name = devices.get_device_name_by_index(index)
-        device = devices.get_device_by_serial_number(serial)
-        sensors = device.get_sensor_list()
-        types = [sensors.get_type_by_index(i) for i in range(sensors.get_count())]
+    serials = [
+        (devices.get_device_serial_number_by_index(i), devices.get_device_name_by_index(i))
+        for i in range(devices.get_count())
+    ]
+    # Serials come from enumeration, which needs no device access; print them
+    # all before opening anything, so a camera that fails to open still shows.
+    for serial, name in serials:
+        print(f"found {name}  serial={serial}")
+    failures = 0
+    for serial, name in serials:
         print(f"== {name}  serial={serial}")
-        print("   sensors: " + ", ".join(str(t).split(".")[-1] for t in types))
-        if ob.OBSensorType.COLOR_SENSOR not in types:
-            print("   WARNING: no COLOR_SENSOR; yam_arms cannot align depth on this device yet")
-        pipeline = ob.Pipeline(device)
-        for label, sensor in (
-            ("colour", ob.OBSensorType.COLOR_SENSOR),
-            ("left colour", ob.OBSensorType.LEFT_COLOR_SENSOR),
-            ("depth", ob.OBSensorType.DEPTH_SENSOR),
-        ):
-            if sensor not in types:
-                continue
-            offered = _profiles(pipeline, sensor)
-            print(f"   {label}: " + (", ".join(offered) or "none"))
-    return 0
+        try:
+            _describe(ob, devices.get_device_by_serial_number(serial))
+        except Exception as exc:
+            failures += 1
+            print(f"   ERROR opening device: {exc}")
+            print(
+                "   Is another process streaming it (a loopback bridge, OrbbecViewer, "
+                "a running eval)? Otherwise check Orbbec's udev rule for USB vendor 2bc5."
+            )
+    return 1 if failures else 0
+
+
+def _describe(ob: Any, device: Any) -> None:
+    """Print one opened device's sensors and its colour and depth profiles."""
+    sensors = device.get_sensor_list()
+    types = [sensors.get_type_by_index(i) for i in range(sensors.get_count())]
+    print("   sensors: " + ", ".join(str(t).split(".")[-1] for t in types))
+    if ob.OBSensorType.COLOR_SENSOR not in types:
+        print("   WARNING: no COLOR_SENSOR; yam_arms cannot align depth on this device yet")
+    pipeline = ob.Pipeline(device)
+    for label, sensor in (
+        ("colour", ob.OBSensorType.COLOR_SENSOR),
+        ("left colour", ob.OBSensorType.LEFT_COLOR_SENSOR),
+        ("depth", ob.OBSensorType.DEPTH_SENSOR),
+    ):
+        if sensor not in types:
+            continue
+        offered = _profiles(pipeline, sensor)
+        print(f"   {label}: " + (", ".join(offered) or "none"))
 
 
 if __name__ == "__main__":
