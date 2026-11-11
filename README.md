@@ -416,6 +416,62 @@ librealsense cannot also be opened through V4L2—there can be only one streamer
 per device node—so `*_cam_device` and `*_depth_serial` are mutually exclusive
 for each slot.
 
+### Orbbec depth
+
+Orbbec cameras supported by Orbbec SDK v2 (for example the Gemini 300 series)
+can serve colour plus aligned depth the same way. Install the Python binding on
+the robot machine with `--no-deps`:
+
+```bash
+uv pip install --no-deps 'pyorbbecsdk2>=2.1.3'
+```
+
+`--no-deps` matters: pyorbbecsdk2 declares its example apps' dependencies
+(opencv-python, open3d, pygame, pynput, and `numpy<2` on Python 3.11) as
+requirements. A normal install puts a second `cv2` next to this package's
+opencv-python-headless and can downgrade numpy. The binding itself needs only
+numpy. Linux also needs Orbbec's udev rules so the cameras open without root.
+
+List the connected cameras, their serials, sensors, and offered profiles:
+
+```bash
+python scripts/orbbec_probe.py
+```
+
+Then give each slot its serial (quote all-digit serials, as for RealSense):
+
+```ini
+top_orbbec_serial = "YOUR-TOP-SERIAL"
+left_orbbec_serial = "YOUR-LEFT-SERIAL"
+right_orbbec_serial = "YOUR-RIGHT-SERIAL"
+```
+
+A slot with `*_orbbec_serial` is owned by pyorbbecsdk. Observations carry the
+same keys as a RealSense slot: the colour image in `images`, and
+`extra["{cam}_depth"]` (float32 metres, aligned to that image) plus
+`extra["{cam}_intrinsics"]` (3×3 K at the published size). Depth is aligned to
+the colour sensor in software with the SDK's `AlignFilter`. Colour arriving as
+RGB, BGR, YUYV, UYVY or MJPG is converted to RGB.
+
+`*_orbbec_serial` is a third source per slot, exclusive with `*_cam_device`
+and `*_depth_serial`, and slots can mix sources. `capture_width` /
+`capture_height`, the `depth_capture_*` sizes and their per-slot overrides, and
+`depth_fps` apply as they do for RealSense. Depth sizes often differ from colour
+sizes, so set `depth_capture_width` / `depth_capture_height` to a size the
+probe lists. A size or rate the camera does not offer fails at open with the
+list of offered profiles.
+
+Limits of this first version:
+
+- Capture runs in the eval process, on one drain thread per camera. There is no
+  capture-child mode like `realsense_capture = process` yet.
+- A device that exposes only a left/right colour pair and no single colour
+  sensor is rejected at open, naming its sensors: the SDK's `AlignFilter`
+  (2.1.3) cannot align depth to a left colour stream, and unaligned depth would
+  be silently wrong. The probe flags such devices.
+- `inspect-robots-yam-health` reports Orbbec slots as unchecked, as it does for
+  RealSense slots, and `inspect-robots setup` does not enumerate them.
+
 Make sure the plugin is installed and the MolmoAct2 server is up. The
 `molmoact2` policy is only a client: nothing moves until the server is
 listening, and it does not start itself or survive a reboot. A connection

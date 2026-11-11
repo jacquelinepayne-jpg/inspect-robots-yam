@@ -49,6 +49,13 @@ The package is `mypy --strict` clean, ships `py.typed`, and is 100%-covered.
   views are per-read copies and must be discarded before close. Keep
   `realsense_capture="inline"` behaviorally equivalent as the debugging escape
   hatch.
+- **Orbbec capture is in-process:** `_OrbbecCameraReader` subclasses the
+  inline `_RealsenseCameraReader`, reusing its frame slots, staleness checks,
+  intrinsics scaling, lazy depth thunks and close discipline, and replaces only
+  device discovery, stream setup, and frame decoding with pyorbbecsdk. It has
+  no capture-child mode. `_import_ob` is its pragma'd seam;
+  `ORBBEC_INSTALL_COMMAND` is the single source of truth for the `--no-deps`
+  install remedy.
 - **Cameras must be released:** `_OpenCVCameraReader` runs a daemon drain thread
   per camera (#63), while the default RealSense reader owns a daemon capture
   child (#95). Both keep devices open until released. `YAMEmbodiment.close()`

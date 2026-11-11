@@ -462,6 +462,37 @@ class _PipelineBundle:
     depth_scale: float
 
 
+#: How to install Orbbec SDK v2's Python binding. ``--no-deps`` is deliberate:
+#: pyorbbecsdk2 declares its example apps' dependencies (opencv-python, open3d,
+#: pygame, pynput, and numpy<2 on Python 3.11) as requirements. Installed
+#: normally it would put a second ``cv2`` next to opencv-python-headless and
+#: downgrade numpy; the binding itself needs only numpy.
+ORBBEC_INSTALL_COMMAND = "uv pip install --no-deps 'pyorbbecsdk2>=2.1.3'"
+
+
+def _import_ob() -> Any:  # pragma: no cover - real pyorbbecsdk
+    """Import pyorbbecsdk on first use with an actionable error when absent."""
+    try:
+        import pyorbbecsdk as ob  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "pyorbbecsdk is required for Orbbec depth streams. Install it with: "
+            f"{ORBBEC_INSTALL_COMMAND}",
+            name="pyorbbecsdk",
+        ) from exc
+    return ob
+
+
+@dataclass(frozen=True)
+class _OrbbecBundle(_PipelineBundle):
+    """An Orbbec pipeline, its depth-to-colour align filter, and the colour K.
+
+    ``depth_scale`` is unused: Orbbec frames carry their own scale.
+    """
+
+    intrinsics: npt.NDArray[np.float32] | None = None
+
+
 @dataclass(frozen=True)
 class _PublishedPair:
     """One raw aligned colour/depth pair, its camera matrix K, and when it landed."""
@@ -824,6 +855,9 @@ class _RealsenseCameraReader:
     if the RealSense open fails, and ``close()`` recovers them.
     """
 
+    #: Device family named in teardown warnings; subclasses for other SDKs override it.
+    _SDK_NAME: ClassVar[str] = "RealSense"
+
     def __init__(
         self,
         serials: Mapping[str, str],
@@ -892,11 +926,16 @@ class _RealsenseCameraReader:
         return extra
 
     def _ensure_open(self) -> None:
-        """Resolve librealsense and open all configured cameras on first use."""
-        rs = self._rs if self._rs is not None else _import_rs()
+        """Resolve the device SDK and open all configured cameras on first use."""
+        rs = self._rs if self._rs is not None else self._import_sdk()
         self._rs = rs
         if not self._bundles:
             self._open_all(rs)
+
+    @staticmethod
+    def _import_sdk() -> Any:  # pragma: no cover - real pyrealsense2
+        """Import the device SDK module; the seam subclasses replace."""
+        return _import_rs()
 
     def close(self) -> None:
         """Stop every drain thread and stop all RealSense pipelines.
@@ -914,16 +953,17 @@ class _RealsenseCameraReader:
             drain = self._threads[name]
             if drain.is_alive():
                 logger.warning(
-                    "camera %s (%s) is still reading; leaving the RealSense "
+                    "camera %s (%s) is still reading; leaving the %s "
                     "pipeline open rather than stopping it underneath the read",
                     name,
                     self._serials[name],
+                    self._SDK_NAME,
                 )
                 continue
             try:
                 bundle.pipeline.stop()
             except Exception:
-                logger.exception("stopping RealSense pipeline for %s failed", name)
+                logger.exception("stopping %s pipeline for %s failed", self._SDK_NAME, name)
         self._bundles = {}
         self._threads = {}
         with self._lock:
@@ -1124,6 +1164,256 @@ class _RealsenseCameraReader:
             return resized.copy()
 
         return resolve
+
+
+class _OrbbecCameraReader(_RealsenseCameraReader):
+    """Own Orbbec cameras through pyorbbecsdk (SDK v2); serve colour, depth, and K.
+
+    The Orbbec counterpart of the inline RealSense reader. It shares that reader's
+    observation surface unchanged: colour resized to ``cam_width x cam_height`` in
+    ``Observation.images``, plus ``{cam}_intrinsics`` (K scaled to the published
+    size) and lazy ``{cam}_depth`` (float32 metres, aligned to the colour image)
+    in ``Observation.extra``. Only device discovery, stream setup, and frame
+    decoding differ.
+
+    The colour stream is the device's colour sensor, and depth is aligned to it
+    in software (``AlignFilter``). A device exposing only a left/right colour pair
+    is rejected at open: AlignFilter (pyorbbecsdk 2.1.3) cannot target a left
+    colour stream, and serving unaligned depth would be silently wrong. Colour
+    frames may arrive as RGB, BGR,
+    YUYV, UYVY, or MJPG and are converted to RGB here. Depth is raw uint16
+    times the frame's own scale (millimetres per unit) converted to metres.
+
+    Capture runs in-process on one daemon drain thread per camera; there is no
+    capture-child mode for Orbbec yet.
+    """
+
+    _SDK_NAME: ClassVar[str] = "Orbbec"
+
+    @staticmethod
+    def _import_sdk() -> Any:  # pragma: no cover - real pyorbbecsdk
+        """Import pyorbbecsdk."""
+        return _import_ob()
+
+    def _open_all(self, ob: Any) -> None:
+        """Resolve and open every camera by serial, or stop the ones opened and re-raise.
+
+        All-or-nothing for the same reason as the RealSense reader: a partially
+        opened set would never be retried.
+        """
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+        device_list = ob.Context().query_devices()
+        visible = {
+            str(device_list.get_device_serial_number_by_index(index)): str(
+                device_list.get_device_name_by_index(index)
+            )
+            for index in range(device_list.get_count())
+        }
+        for name, serial in self._serials.items():
+            if serial not in visible:
+                listing = ", ".join(f"{label} / {sn}" for sn, label in visible.items())
+                raise RuntimeError(
+                    f"cannot find Orbbec camera {name} ({serial}); "
+                    f"visible devices: {listing or 'none'}"
+                )
+        bundles: dict[str, _PipelineBundle] = {}
+        try:
+            for name, serial in self._serials.items():
+                device = device_list.get_device_by_serial_number(serial)
+                bundles[name] = self._open_one(ob, name, device, generation)
+        except BaseException:
+            for bundle in bundles.values():
+                with contextlib.suppress(Exception):
+                    bundle.pipeline.stop()
+            with self._lock:
+                self._published = {}
+                self._faults = {}
+            raise
+        self._stop = threading.Event()
+        self._bundles = bundles
+        for name, bundle in bundles.items():
+            thread = threading.Thread(
+                target=self._drain,
+                args=(name, bundle, self._stop, generation),
+                name=f"yam-camera-{name}",
+                daemon=True,
+            )
+            self._threads[name] = thread
+            thread.start()
+
+    @staticmethod
+    def _require_colour_sensor(ob: Any, device: Any, name: str) -> None:
+        """Reject a device without a single colour sensor, naming the sensors it has."""
+        sensors = device.get_sensor_list()
+        types = [sensors.get_type_by_index(index) for index in range(sensors.get_count())]
+        if ob.OBSensorType.COLOR_SENSOR in types:
+            return
+        found = ", ".join(str(sensor_type) for sensor_type in types)
+        raise RuntimeError(
+            f"Orbbec camera {name} has no colour sensor to align depth to; sensors: "
+            f"{found or 'none'}. Devices exposing only a left/right colour pair are not "
+            f"supported yet"
+        )
+
+    def _profile(
+        self, ob: Any, pipeline: Any, sensor: Any, size: tuple[int, int], name: str, kind: str
+    ) -> Any:
+        """Select a ``width x height @ depth_fps`` profile, listing the offered ones on failure."""
+        profiles = pipeline.get_stream_profile_list(sensor)
+        width, height = size
+        try:
+            return profiles.get_video_stream_profile(
+                width, height, ob.OBFormat.UNKNOWN_FORMAT, self._depth_fps
+            )
+        except Exception as exc:
+            offered = sorted(
+                {
+                    (profile.get_width(), profile.get_height(), profile.get_fps())
+                    for profile in (
+                        profiles.get_stream_profile_by_index(index).as_video_stream_profile()
+                        for index in range(profiles.get_count())
+                    )
+                }
+            )
+            listing = ", ".join(f"{w}x{h}@{fps}" for w, h, fps in offered)
+            raise RuntimeError(
+                f"Orbbec camera {name} offers no {kind} stream at {width}x{height}@"
+                f"{self._depth_fps}; offered: {listing or 'none'}"
+            ) from exc
+
+    def _open_one(self, ob: Any, name: str, device: Any, generation: int) -> _OrbbecBundle:
+        """Start colour+depth on one device, build the align filter, and seed from warm-up."""
+        self._require_colour_sensor(ob, device, name)
+        pipeline = ob.Pipeline(device)
+        width, height = self._capture_sizes.get(name, self._capture_size)
+        depth_size = self._depth_capture_sizes.get(
+            name, self._depth_capture_size or (width, height)
+        )
+        colour_profile = self._profile(
+            ob, pipeline, ob.OBSensorType.COLOR_SENSOR, (width, height), name, "colour"
+        )
+        depth_profile = self._profile(
+            ob, pipeline, ob.OBSensorType.DEPTH_SENSOR, depth_size, name, "depth"
+        )
+        ob_cfg = ob.Config()
+        ob_cfg.enable_stream(colour_profile)
+        ob_cfg.enable_stream(depth_profile)
+        # Only whole colour+depth sets are useful: a lone frame cannot be aligned.
+        ob_cfg.set_frame_aggregate_output_mode(ob.OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE)
+        pipeline.start(ob_cfg)
+        try:
+            intr = colour_profile.get_intrinsic()
+            k_matrix: npt.NDArray[np.float32] = np.array(
+                [
+                    [float(intr.fx), 0.0, float(intr.cx)],
+                    [0.0, float(intr.fy), float(intr.cy)],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            bundle = _OrbbecBundle(
+                pipeline=pipeline,
+                align=ob.AlignFilter(align_to_stream=ob.OBStreamType.COLOR_STREAM),
+                depth_scale=0.0,
+                intrinsics=k_matrix,
+            )
+            for _ in range(10):  # warm-up: the first sets can take a moment to arrive
+                frames = pipeline.wait_for_frames(1000)
+                if frames is None:
+                    self._sleep(0.1)
+                    continue
+                if self._publish_set(name, bundle, frames, generation):
+                    break
+            return bundle
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                pipeline.stop()
+            raise
+
+    def _drain(
+        self,
+        name: str,
+        bundle: _PipelineBundle,
+        stop: threading.Event,
+        generation: int,
+    ) -> None:
+        """Publish frame sets until stopped, latching whatever ends the loop."""
+        assert isinstance(bundle, _OrbbecBundle)
+        while not stop.is_set():
+            try:
+                frames = bundle.pipeline.wait_for_frames(1000)
+                if frames is None:
+                    continue
+                self._publish_set(name, bundle, frames, generation)
+            except BaseException as exc:
+                with self._lock:
+                    if generation == self._generation:
+                        self._faults[name] = exc
+                return
+
+    def _publish_set(self, name: str, bundle: _OrbbecBundle, frames: Any, generation: int) -> bool:
+        """Align one frame set to colour and publish it; False when it was incomplete."""
+        aligned = bundle.align.process(frames)
+        if aligned is None:
+            return False
+        frame_set = aligned.as_frame_set()
+        colour_frame = frame_set.get_color_frame()
+        depth_frame = frame_set.get_depth_frame()
+        if colour_frame is None or depth_frame is None:
+            return False
+        colour = self._colour_rgb(colour_frame)
+        depth_h, depth_w = int(depth_frame.get_height()), int(depth_frame.get_width())
+        raw = np.asarray(depth_frame.get_data(), dtype=np.uint8)
+        if raw.size != depth_h * depth_w * 2:
+            raise ValueError(
+                f"Orbbec depth frame for {name} has {raw.size} bytes, expected "
+                f"{depth_h * depth_w * 2} for {depth_w}x{depth_h} uint16"
+            )
+        depth: npt.NDArray[np.uint16] = raw.view(np.uint16).reshape(depth_h, depth_w).copy()
+        assert bundle.intrinsics is not None
+        with self._lock:
+            if generation != self._generation:
+                return True
+            self._published[name] = _PublishedPair(
+                colour=colour,
+                depth=depth,
+                intrinsics=bundle.intrinsics,
+                # get_depth_scale() is millimetres per unit; the pair stores metres.
+                depth_scale=float(depth_frame.get_depth_scale()) * 0.001,
+                published_s=self._clock(),
+            )
+        return True
+
+    def _colour_rgb(self, frame: Any) -> npt.NDArray[np.uint8]:
+        """Decode one colour frame into a copied ``(H, W, 3)`` RGB uint8 array."""
+        ob = self._rs
+        assert ob is not None  # resolved by _ensure_open before any frame is read
+        cv2 = self._cv2 if self._cv2 is not None else _import_cv2()
+        self._cv2 = cv2
+        height, width = int(frame.get_height()), int(frame.get_width())
+        data = np.asarray(frame.get_data(), dtype=np.uint8)
+        fmt = frame.get_format()
+        if fmt == ob.OBFormat.RGB:
+            return data.reshape(height, width, 3).copy()
+        if fmt == ob.OBFormat.BGR:
+            bgr = data.reshape(height, width, 3)
+            return np.asarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), dtype=np.uint8)
+        if fmt in (ob.OBFormat.YUYV, ob.OBFormat.YUY2):
+            packed = data.reshape(height, width, 2)
+            return np.asarray(cv2.cvtColor(packed, cv2.COLOR_YUV2RGB_YUYV), dtype=np.uint8)
+        if fmt == ob.OBFormat.UYVY:
+            packed = data.reshape(height, width, 2)
+            return np.asarray(cv2.cvtColor(packed, cv2.COLOR_YUV2RGB_UYVY), dtype=np.uint8)
+        if fmt == ob.OBFormat.MJPG:
+            decoded = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError("Orbbec MJPG colour frame could not be decoded")
+            return np.asarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB), dtype=np.uint8)
+        raise ValueError(
+            f"unsupported Orbbec colour format {fmt}; expected RGB, BGR, YUYV, UYVY, or MJPG"
+        )
 
 
 class _ProcessRealsenseCameraReader:
@@ -1547,13 +1837,24 @@ class YAMEmbodiment:
             )
             if serial is not None
         }
+        orbbec_serials = {
+            name: serial
+            for name, serial in (
+                ("top_cam", self._cfg.top_orbbec_serial),
+                ("left_cam", self._cfg.left_orbbec_serial),
+                ("right_cam", self._cfg.right_orbbec_serial),
+            )
+            if serial is not None
+        }
         self._builtin_realsense_reader: _RealsenseReader | None = None
+        self._builtin_orbbec_reader: _OrbbecCameraReader | None = None
         if camera_reader is not None:
-            if depth_serials:
+            if depth_serials or orbbec_serials:
                 raise ValueError(
-                    "custom camera_reader conflicts with configured *_depth_serial "
-                    "values: configured depth serials drive the builtin capture path; "
-                    "with a custom camera_reader, supply depth via depth_reader instead"
+                    "custom camera_reader conflicts with configured *_depth_serial or "
+                    "*_orbbec_serial values: configured depth serials drive the builtin "
+                    "capture path; with a custom camera_reader, supply depth via "
+                    "depth_reader instead"
                 )
         else:
             builtin_readers: list[CameraReader] = []
@@ -1590,6 +1891,20 @@ class YAMEmbodiment:
                         depth_capture_sizes=depth_capture_sizes,
                     )
                 builtin_readers.append(self._builtin_realsense_reader)
+            if orbbec_serials:
+                self._builtin_orbbec_reader = _OrbbecCameraReader(
+                    orbbec_serials,
+                    self._cfg.depth_fps,
+                    capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                    depth_capture_size=self._cfg.depth_capture_size,
+                    capture_sizes={
+                        name: self._cfg.capture_size_for(name) for name in orbbec_serials
+                    },
+                    depth_capture_sizes={
+                        name: self._cfg.depth_capture_size_for(name) for name in orbbec_serials
+                    },
+                )
+                builtin_readers.append(self._builtin_orbbec_reader)
             if len(builtin_readers) == 1:
                 camera_reader = builtin_readers[0]
             elif builtin_readers:
@@ -1662,8 +1977,8 @@ class YAMEmbodiment:
                 "pose it had at the first observation, and sleep there (the sleep tool, "
                 "when offered) until the reading has dropped, before continuing."
             )
-        if self._builtin_realsense_reader is not None:
-            depth_cameras = ", ".join(sorted(depth_serials))
+        if self._builtin_realsense_reader is not None or self._builtin_orbbec_reader is not None:
+            depth_cameras = ", ".join(sorted(depth_serials.keys() | orbbec_serials.keys()))
             docs += (
                 f"\n\nDepth: for each serial-configured camera ({depth_cameras}), "
                 '``observation.extra["{cam}_depth"]`` arrives either as an H\u00d7W '
@@ -1864,8 +2179,9 @@ class YAMEmbodiment:
         if self._camera_reader is _default_camera_reader or not callable(self._camera_reader):
             raise ConfigError(
                 "yam_arms has no cameras configured. Set exactly one source per "
-                "camera slot: *_cam_device for V4L2 colour or *_depth_serial for "
-                "RealSense colour+depth, in YamConfig, config.ini "
+                "camera slot: *_cam_device for V4L2 colour, *_depth_serial for "
+                "RealSense colour+depth, or *_orbbec_serial for Orbbec "
+                "colour+depth, in YamConfig, config.ini "
                 "([embodiment.args]), or the CLI; or provide a custom "
                 "camera_reader= via the Python API."
             )
@@ -2819,6 +3135,8 @@ class YAMEmbodiment:
         extra: dict[str, Any] = {}
         if self._builtin_realsense_reader is not None:
             extra.update(self._builtin_realsense_reader.extra(self._cfg))
+        if self._builtin_orbbec_reader is not None:
+            extra.update(self._builtin_orbbec_reader.extra(self._cfg))
         if self._depth_reader is not None:
             extra.update(self._depth_reader(self._cfg))
         if self._cfg.motor_temp_limit is not None and self._last_motor_temps is not None:

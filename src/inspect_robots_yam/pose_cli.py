@@ -36,6 +36,9 @@ _RAW_STRING_KEYS = _POSE_CONFIG_KEYS | frozenset(
         "top_depth_serial",
         "left_depth_serial",
         "right_depth_serial",
+        "top_orbbec_serial",
+        "left_orbbec_serial",
+        "right_orbbec_serial",
     }
 )
 _GRIPPER_INDICES = (packing.ARM_DOF, packing.ARM_WIDTH + packing.ARM_DOF)

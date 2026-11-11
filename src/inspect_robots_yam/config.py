@@ -162,7 +162,8 @@ class YamConfig(_FromKwargs):
     # Per-camera overrides of the two pairs above (plan 0033). None means "use
     # the rig-wide value". A mixed rig can then run its D435 top camera at
     # 1920 x 1080 while D405 wrists stay within their 1280 x 720 maximum.
-    # Depth overrides apply only to a slot with `{slot}_depth_serial`.
+    # Depth overrides apply only to a slot with `{slot}_depth_serial` or
+    # `{slot}_orbbec_serial`.
     top_capture_width: int | None = None
     top_capture_height: int | None = None
     left_capture_width: int | None = None
@@ -277,15 +278,29 @@ class YamConfig(_FromKwargs):
     top_depth_serial: str | None = None
     left_depth_serial: str | None = None
     right_depth_serial: str | None = None
+    # Optional Orbbec sources (Gemini 300 series and other devices supported by
+    # Orbbec SDK v2): setting `{slot}_orbbec_serial` hands that camera slot to
+    # pyorbbecsdk, which serves its colour image plus depth aligned to that
+    # colour frame and the colour intrinsics, exactly as a RealSense slot does.
+    # It is a third mutually exclusive source for the slot. The serial is the
+    # one OrbbecViewer or `DeviceList.get_device_serial_number_by_index` reports.
+    # Capture runs in-process on one drain thread per camera. Install the
+    # binding with `embodiment.ORBBEC_INSTALL_COMMAND` (not a pip extra: its
+    # declared dependencies would clash with opencv-python-headless). Quote
+    # all-digit serials in config.ini, as for `*_depth_serial`.
+    top_orbbec_serial: str | None = None
+    left_orbbec_serial: str | None = None
+    right_orbbec_serial: str | None = None
     # Capture all configured RealSense cameras in one spawn child by default,
     # keeping librealsense and frame-copy work outside the motor-control
     # interpreter. "inline" restores the prior in-process implementation as a
     # debugging escape hatch.
     realsense_capture: str = "process"
-    # Librealsense colour and depth stream rate. Both streams use the same rate;
-    # capture resolution remains fixed at 640x480. Valid range: 1 through 90,
-    # but devices only accept their discrete rates (D435/D405: 6/15/30/60/90);
-    # an unsupported rate fails at camera open with the librealsense error.
+    # Colour and depth stream rate for RealSense and Orbbec slots. Both streams
+    # use the same rate. Valid range: 1 through 90, but devices only accept
+    # their discrete rates (D435/D405: 6/15/30/60/90; Gemini 305:
+    # 5/10/15/20/30/60); an unsupported rate fails at camera open with the
+    # SDK error.
     depth_fps: int = 30
     # Opt-in raw estimated torque state. Kept off by default because adding a
     # runtime observation key changes the policy-facing contract.
@@ -315,8 +330,11 @@ class YamConfig(_FromKwargs):
                     f"{field} must be a string; quote the value in config.ini — "
                     "numeric values are int-coerced and may lose leading zeros"
                 )
-        for slot in ("top", "left", "right"):
-            field = f"{slot}_depth_serial"
+        for field in (
+            f"{slot}_{suffix}"
+            for slot in ("top", "left", "right")
+            for suffix in ("depth_serial", "orbbec_serial")
+        ):
             if isinstance(flat.get(field), int):
                 raise ValueError(
                     f"{field} must be a string; quote the serial in config.ini — "
@@ -547,10 +565,12 @@ class YamConfig(_FromKwargs):
             if (
                 getattr(self, f"{slot}_depth_capture_width") is not None
                 and getattr(self, f"{slot}_depth_serial") is None
+                and getattr(self, f"{slot}_orbbec_serial") is None
             ):
                 raise ValueError(
-                    f"{slot}_depth_capture_width/height only apply to a RealSense slot; "
-                    f"set {slot}_depth_serial or remove the depth override"
+                    f"{slot}_depth_capture_width/height only apply to a depth slot; "
+                    f"set {slot}_depth_serial or {slot}_orbbec_serial, or remove the "
+                    f"depth override"
                 )
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
@@ -567,7 +587,7 @@ class YamConfig(_FromKwargs):
         camera_source_fields = tuple(
             f"{slot}_{suffix}"
             for slot in ("top", "left", "right")
-            for suffix in ("cam_device", "depth_serial")
+            for suffix in ("cam_device", "depth_serial", "orbbec_serial")
         )
         for field in camera_source_fields:
             value = getattr(self, field)
@@ -586,18 +606,20 @@ class YamConfig(_FromKwargs):
                     f"{_redact_userinfo(device)!r}"
                 )
             cam_device_fields[device] = field
-        depth_serial_fields: dict[str, str] = {}
-        for slot in ("top", "left", "right"):
-            field = f"{slot}_depth_serial"
-            serial = getattr(self, field)
-            if serial is None:
-                continue
-            previous = depth_serial_fields.get(serial)
-            if previous is not None:
-                raise ValueError(
-                    f"{previous} and {field} must be different; duplicate depth serial {serial!r}"
-                )
-            depth_serial_fields[serial] = field
+        for suffix in ("depth_serial", "orbbec_serial"):
+            serial_fields: dict[str, str] = {}
+            for slot in ("top", "left", "right"):
+                field = f"{slot}_{suffix}"
+                serial = getattr(self, field)
+                if serial is None:
+                    continue
+                previous = serial_fields.get(serial)
+                if previous is not None:
+                    raise ValueError(
+                        f"{previous} and {field} must be different; duplicate "
+                        f"{suffix.replace('_', ' ')} {serial!r}"
+                    )
+                serial_fields[serial] = field
         for slot in ("top", "left", "right"):
             if getattr(self, f"{slot}_cam_device") is not None and (
                 getattr(self, f"{slot}_depth_serial") is not None
@@ -607,11 +629,24 @@ class YamConfig(_FromKwargs):
                     f"exclusive: a RealSense camera opened through librealsense "
                     f"cannot also be opened through V4L2 (one streamer per node)"
                 )
+            configured = [
+                f"{slot}_{suffix}"
+                for suffix in ("cam_device", "depth_serial", "orbbec_serial")
+                if getattr(self, f"{slot}_{suffix}") is not None
+            ]
+            if f"{slot}_orbbec_serial" in configured and len(configured) > 1:
+                raise ValueError(
+                    f"{' and '.join(configured)} are mutually exclusive: each camera "
+                    f"slot takes one source, and an Orbbec camera opened through "
+                    f"pyorbbecsdk cannot also be opened another way"
+                )
         sourced = {
             slot
             for slot in ("top", "left", "right")
-            if getattr(self, f"{slot}_cam_device") is not None
-            or getattr(self, f"{slot}_depth_serial") is not None
+            if any(
+                getattr(self, f"{slot}_{suffix}") is not None
+                for suffix in ("cam_device", "depth_serial", "orbbec_serial")
+            )
         }
         if sourced and len(sourced) != 3:
             unsourced = ", ".join(slot for slot in ("top", "left", "right") if slot not in sourced)

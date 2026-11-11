@@ -56,9 +56,13 @@ MIN_SETTLE_S = 0.2
 #: Argparse dests for --top-cam/--left-cam/--right-cam; also the flag-vs-``-E``
 #: conflict domain (depth serials have no flags).
 _CAMERA_FLAG_KEYS = frozenset({"top_cam_device", "left_cam_device", "right_cam_device"})
-_DEPTH_SERIAL_KEYS = frozenset({"top_depth_serial", "left_depth_serial", "right_depth_serial"})
+_DEPTH_SERIAL_KEYS = frozenset(
+    f"{slot}_{suffix}"
+    for slot in ("top", "left", "right")
+    for suffix in ("depth_serial", "orbbec_serial")
+)
 #: ``-E`` values that must never be scalar-coerced: a numeric device index or
-#: RealSense serial would otherwise arrive as int and traceback in validation.
+#: RealSense/Orbbec serial would otherwise arrive as int and traceback in validation.
 _RAW_STRING_KEYS = _CAMERA_FLAG_KEYS | _DEPTH_SERIAL_KEYS
 #: Every camera-slot key: the skip-conflict and slot-supersession domain.
 _CAMERA_SLOT_KEYS = _RAW_STRING_KEYS
@@ -204,12 +208,12 @@ def _camera_devices(cfg: YamConfig) -> tuple[tuple[str, str], ...]:
 
 
 def _unchecked_depth_cameras(cfg: YamConfig) -> tuple[UncheckedCamera, ...]:
-    """Return configured RealSense slots that this V4L2-only tool cannot check."""
-    serials = (cfg.top_depth_serial, cfg.left_depth_serial, cfg.right_depth_serial)
+    """Return configured RealSense and Orbbec slots that this V4L2-only tool cannot check."""
     return tuple(
         UncheckedCamera(name=name, reason=_DEPTH_UNCHECKED_REASON)
-        for name, serial in zip(DEFAULT_CAMERAS, serials, strict=True)
-        if serial is not None
+        for name, slot in zip(DEFAULT_CAMERAS, _CAMERA_SLOTS, strict=True)
+        if getattr(cfg, f"{slot}_depth_serial") is not None
+        or getattr(cfg, f"{slot}_orbbec_serial") is not None
     )
 
 
@@ -496,7 +500,7 @@ def main(
     explicit_keys = extras.keys() | flag_values.keys()
     explicit_camera_keys = _CAMERA_SLOT_KEYS & explicit_keys
     for slot in _CAMERA_SLOTS:
-        slot_keys = {f"{slot}_cam_device", f"{slot}_depth_serial"}
+        slot_keys = {f"{slot}_cam_device", f"{slot}_depth_serial", f"{slot}_orbbec_serial"}
         if slot_keys & explicit_camera_keys:
             for key in slot_keys | {
                 f"{slot}_depth_capture_width",
