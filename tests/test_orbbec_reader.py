@@ -20,7 +20,7 @@ import numpy.typing as npt
 import pytest
 
 import inspect_robots_yam.embodiment as embodiment_module
-from inspect_robots_yam.config import YamConfig
+from inspect_robots_yam.config import YamConfig, parse_camera_source
 from inspect_robots_yam.embodiment import (
     ORBBEC_INSTALL_COMMAND,
     YAMEmbodiment,
@@ -29,7 +29,7 @@ from inspect_robots_yam.embodiment import (
     _OrbbecCameraReader,
 )
 from inspect_robots_yam.health import HealthReport as HealthReportType
-from inspect_robots_yam.health import _unchecked_depth_cameras, main
+from inspect_robots_yam.health import _camera_devices, _unchecked_depth_cameras, main
 from inspect_robots_yam.operator import OperatorIO
 
 SERIALS = {"top_cam": "OB1", "left_cam": "OB2", "right_cam": "OB3"}
@@ -750,49 +750,98 @@ def test_install_command_skips_the_bindings_example_dependencies() -> None:
 
 # --------------------------------------------------------------------------- config
 
+ORBBEC_RIG = {
+    "top_cam_device": "orbbec://OB1",
+    "left_cam_device": "orbbec://OB2",
+    "right_cam_device": "orbbec://OB3",
+}
 
-def test_orbbec_serials_are_a_camera_source() -> None:
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        ("orbbec://CV2F861000BA", ("orbbec", "CV2F861000BA")),
+        ("realsense://0385220", ("realsense", "0385220")),
+        ("/dev/v4l/by-id/usb-cam-video-index0", ("opencv", "/dev/v4l/by-id/usb-cam-video-index0")),
+        ("http://hub/api/stream.mjpeg?src=top", ("opencv", "http://hub/api/stream.mjpeg?src=top")),
+        ("rtsps://hub/top", ("opencv", "rtsps://hub/top")),
+    ],
+)
+def test_parse_camera_source_picks_the_backend_from_the_value(
+    device: str, expected: tuple[str, str]
+) -> None:
+    assert parse_camera_source(device) == expected
+
+
+def test_unknown_camera_scheme_is_rejected_with_the_supported_list() -> None:
+    with pytest.raises(ValueError, match=r"unsupported camera source scheme 'zed://'; supported: "):
+        parse_camera_source("zed://123")
+    with pytest.raises(ValueError, match="unsupported camera source scheme 'zed://'"):
+        YamConfig(top_cam_device="zed://1", left_cam_device="/dev/l", right_cam_device="/dev/r")
+
+
+def test_camera_source_reads_depth_serial_as_realsense_and_unsourced_as_none() -> None:
     config = YamConfig(
-        top_orbbec_serial="OB1", left_orbbec_serial="OB2", right_cam_device="/dev/right"
+        top_depth_serial="RS1", left_cam_device="orbbec://OB2", right_cam_device="/dev/right"
     )
 
-    assert config.top_orbbec_serial == "OB1"
-    assert config.left_orbbec_serial == "OB2"
+    assert config.camera_source("top_cam") == ("realsense", "RS1")
+    assert config.camera_source("left") == ("orbbec", "OB2")
+    assert config.camera_source("right_cam") == ("opencv", "/dev/right")
+    assert YamConfig().camera_source("top_cam") is None
 
 
-@pytest.mark.parametrize("other", ["cam_device", "depth_serial"])
-def test_orbbec_serial_excludes_other_sources_for_the_slot(other: str) -> None:
-    with pytest.raises(ValueError, match=f"top_{other} and top_orbbec_serial are mutually"):
+def test_camera_sources_groups_slots_by_backend() -> None:
+    config = YamConfig(
+        top_cam_device="realsense://RS1",
+        left_cam_device="orbbec://OB2",
+        right_cam_device="/dev/right",
+    )
+
+    assert config.camera_sources("realsense") == {"top_cam": "RS1"}
+    assert config.camera_sources("orbbec") == {"left_cam": "OB2"}
+    assert config.camera_sources("opencv") == {"right_cam": "/dev/right"}
+    with pytest.raises(ValueError, match="unknown camera backend 'zed'"):
+        config.camera_sources("zed")
+
+
+@pytest.mark.parametrize("device", ["orbbec://", "realsense:// "])
+def test_depth_scheme_without_a_serial_is_rejected(device: str) -> None:
+    with pytest.raises(ValueError, match=r"top_cam_device .* names no camera serial"):
+        YamConfig(top_cam_device=device, left_cam_device="/dev/l", right_cam_device="/dev/r")
+
+
+def test_duplicate_orbbec_devices_are_rejected() -> None:
+    with pytest.raises(ValueError, match="top_cam_device and left_cam_device must be different"):
+        YamConfig(**{**ORBBEC_RIG, "left_cam_device": "orbbec://OB1"})
+
+
+def test_one_realsense_serial_cannot_serve_two_slots_through_both_spellings() -> None:
+    with pytest.raises(ValueError, match="top_cam and left_cam both use realsense camera 'RS1'"):
         YamConfig(
-            top_orbbec_serial="OB1",
-            left_orbbec_serial="OB2",
-            right_orbbec_serial="OB3",
-            **{f"top_{other}": "X"},
+            top_cam_device="realsense://RS1", left_depth_serial="RS1", right_cam_device="/dev/r"
         )
 
 
-def test_duplicate_orbbec_serials_are_rejected() -> None:
-    with pytest.raises(
-        ValueError, match="top_orbbec_serial and left_orbbec_serial must be different; duplicate"
-    ):
-        YamConfig(top_orbbec_serial="OB1", left_orbbec_serial="OB1", right_orbbec_serial="OB3")
-
-
-def test_empty_orbbec_serial_is_rejected() -> None:
-    with pytest.raises(ValueError, match="top_orbbec_serial must be a non-empty string"):
-        YamConfig(top_orbbec_serial=" ")
+def test_realsense_device_and_depth_serial_for_one_slot_are_rejected() -> None:
+    with pytest.raises(ValueError, match="top_cam_device and top_depth_serial are mutually"):
+        YamConfig(
+            top_cam_device="realsense://RS1",
+            top_depth_serial="RS1",
+            left_cam_device="/dev/l",
+            right_cam_device="/dev/r",
+        )
 
 
 def test_partial_orbbec_rig_must_source_every_slot() -> None:
     with pytest.raises(ValueError, match="unsourced slots: left, right"):
-        YamConfig(top_orbbec_serial="OB1")
+        YamConfig(top_cam_device="orbbec://OB1")
 
 
-def test_depth_capture_override_applies_to_an_orbbec_slot() -> None:
+@pytest.mark.parametrize("scheme", ["orbbec", "realsense"])
+def test_depth_capture_override_applies_to_a_depth_scheme_slot(scheme: str) -> None:
     config = YamConfig(
-        top_orbbec_serial="OB1",
-        left_orbbec_serial="OB2",
-        right_orbbec_serial="OB3",
+        **{**ORBBEC_RIG, "top_cam_device": f"{scheme}://X1"},
         top_depth_capture_width=320,
         top_depth_capture_height=240,
     )
@@ -800,15 +849,19 @@ def test_depth_capture_override_applies_to_an_orbbec_slot() -> None:
     assert config.depth_capture_size_for("top_cam") == (320, 240)
 
 
-def test_depth_capture_override_on_a_v4l2_slot_names_both_depth_sources() -> None:
-    with pytest.raises(ValueError, match="set top_depth_serial or top_orbbec_serial"):
-        YamConfig(top_depth_capture_width=320, top_depth_capture_height=240)
+def test_depth_capture_override_on_a_v4l2_slot_names_every_depth_source() -> None:
+    with pytest.raises(
+        ValueError, match="set top_depth_serial or a realsense:// or orbbec:// top_cam_device"
+    ):
+        YamConfig(
+            **{**ORBBEC_RIG, "top_cam_device": "/dev/top"},
+            top_depth_capture_width=320,
+            top_depth_capture_height=240,
+        )
 
 
-@pytest.mark.parametrize("field", ["top_orbbec_serial", "right_orbbec_serial"])
-def test_from_kwargs_guides_int_orbbec_serials(field: str) -> None:
-    with pytest.raises(ValueError, match=f"{field} must be a string; quote the serial"):
-        YamConfig.from_kwargs(**{field: 1234})
+def test_stream_schemes_stay_importable_from_the_embodiment_module() -> None:
+    assert embodiment_module.STREAM_SCHEMES == ("http://", "https://", "rtsp://", "rtsps://")
 
 
 # --------------------------------------------------------------------------- embodiment
@@ -892,11 +945,7 @@ def observe_once(emb: YAMEmbodiment) -> Any:
 def test_orbbec_only_rig_observes_images_depth_and_intrinsics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = cfg(
-        top_orbbec_serial="OB1",
-        left_orbbec_serial="OB2",
-        right_orbbec_serial="OB3",
-    )
+    config = cfg(**ORBBEC_RIG)
     emb, ob = builtin_embodiment(config, monkeypatch)
     assert isinstance(emb._builtin_orbbec_reader, _OrbbecCameraReader)
     assert emb._builtin_realsense_reader is None
@@ -916,11 +965,7 @@ def test_orbbec_only_rig_observes_images_depth_and_intrinsics(
 def test_mixed_v4l2_and_orbbec_rig_serves_depth_only_for_orbbec_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = cfg(
-        top_cam_device="/dev/top",
-        left_orbbec_serial="OB2",
-        right_orbbec_serial="OB3",
-    )
+    config = cfg(**{**ORBBEC_RIG, "top_cam_device": "/dev/top"})
     emb, _ = builtin_embodiment(config, monkeypatch)
     assert isinstance(emb._camera_reader, _CompositeCameraReader)
 
@@ -933,11 +978,27 @@ def test_mixed_v4l2_and_orbbec_rig_serves_depth_only_for_orbbec_slots(
     assert "Depth: for each serial-configured camera (left_cam, right_cam)" in emb.info.docs
 
 
-def test_custom_camera_reader_conflicts_with_orbbec_serials() -> None:
-    config = YamConfig(top_orbbec_serial="OB1", left_orbbec_serial="OB2", right_orbbec_serial="OB3")
+def test_custom_camera_reader_conflicts_with_orbbec_devices() -> None:
+    config = YamConfig(**ORBBEC_RIG)
 
-    with pytest.raises(ValueError, match="conflicts with configured \\*_depth_serial or"):
+    with pytest.raises(ValueError, match="conflicts with configured depth cameras"):
         YAMEmbodiment(config, camera_reader=lambda _cfg: {})
+
+
+def test_realsense_scheme_slot_is_served_by_the_realsense_reader() -> None:
+    config = YamConfig(
+        top_cam_device="realsense://RS1",
+        left_depth_serial="RS2",
+        right_cam_device="orbbec://OB3",
+        realsense_capture="inline",
+    )
+
+    emb = YAMEmbodiment(config)
+
+    assert emb._builtin_realsense_reader is not None
+    assert emb._builtin_realsense_reader._serials == {"top_cam": "RS1", "left_cam": "RS2"}  # type: ignore[attr-defined]
+    assert emb._builtin_orbbec_reader is not None
+    assert emb._builtin_orbbec_reader._serials == {"right_cam": "OB3"}
 
 
 def test_unconfigured_cameras_error_names_the_orbbec_source() -> None:
@@ -953,25 +1014,26 @@ def test_unconfigured_cameras_error_names_the_orbbec_source() -> None:
     from inspect_robots.errors import ConfigError
     from inspect_robots.scene import Scene
 
-    with pytest.raises(ConfigError, match=r"\*_orbbec_serial for Orbbec"):
+    with pytest.raises(ConfigError, match=r"orbbec://SERIAL or realsense://SERIAL"):
         emb.reset(Scene(id="s", instruction="task"))
 
 
 # --------------------------------------------------------------------------- health
 
 
-def test_health_reports_orbbec_slots_as_unchecked() -> None:
+def test_health_checks_only_opencv_slots_and_reports_depth_slots_unchecked() -> None:
     config = YamConfig(
-        top_cam_device="/dev/top", left_orbbec_serial="OB2", right_depth_serial="RS3"
+        top_cam_device="/dev/top", left_cam_device="orbbec://OB2", right_depth_serial="RS3"
     )
 
+    assert _camera_devices(config) == (("top_cam", "/dev/top"),)
     assert [camera.name for camera in _unchecked_depth_cameras(config)] == [
         "left_cam",
         "right_cam",
     ]
 
 
-def test_health_keeps_an_all_digit_orbbec_serial_a_string() -> None:
+def test_health_keeps_an_all_digit_orbbec_serial_intact() -> None:
     seen: list[YamConfig] = []
 
     def capture(cfg_value: YamConfig, **_kwargs: object) -> HealthReportType:
@@ -980,7 +1042,7 @@ def test_health_keeps_an_all_digit_orbbec_serial_a_string() -> None:
 
     args = [
         "-E",
-        "top_orbbec_serial=0123",
+        "top_cam_device=orbbec://0123",
         "--left-cam",
         "/dev/left",
         "--right-cam",
@@ -988,7 +1050,7 @@ def test_health_keeps_an_all_digit_orbbec_serial_a_string() -> None:
         "--skip-motors",
     ]
     assert main(args, run=capture) == 0
-    assert seen[0].top_orbbec_serial == "0123"
+    assert seen[0].camera_source("top_cam") == ("orbbec", "0123")
 
 
 def test_camera_that_misses_every_warm_up_wait_is_served_by_its_drain() -> None:

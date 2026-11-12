@@ -8,12 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **Orbbec depth cameras:** `top/left/right_orbbec_serial` hand a camera slot
-  to pyorbbecsdk (Orbbec SDK v2, e.g. Gemini 300 series), which serves its
+- **Orbbec depth cameras:** `*_cam_device = orbbec://SERIAL` hands a camera
+  slot to pyorbbecsdk (Orbbec SDK v2, e.g. Gemini 300 series), which serves its
   colour image plus `extra["{cam}_depth"]` (float32 metres, aligned to the
   colour image in software) and `extra["{cam}_intrinsics"]`, the same keys as a
-  RealSense slot. It is a third exclusive source per slot and honours the
-  existing capture sizes and `depth_fps`. Install the binding with
+  RealSense slot. `*_cam_device` now picks its reader from the value's scheme:
+  `realsense://SERIAL` is equivalent to `*_depth_serial`, and an unknown
+  scheme is rejected at config load. It honours the existing capture sizes and
+  `depth_fps`. Install the binding with
   `uv pip install --no-deps 'pyorbbecsdk2>=2.1.3'`; `--no-deps` keeps its
   example-app dependencies (a second OpenCV, open3d, `numpy<2` on 3.11) off
   the rig. `scripts/orbbec_probe.py` lists serials, sensors and profiles.

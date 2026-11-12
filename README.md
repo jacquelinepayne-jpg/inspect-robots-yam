@@ -449,16 +449,22 @@ python scripts/orbbec_probe.py
 python scripts/orbbec_probe.py --snap ~/orbbec-snaps   # one <serial>.jpg per camera
 ```
 
-The snapshots show which serial is the top, left, and right camera. Then give
-each slot its serial (quote all-digit serials, as for RealSense):
+The snapshots show which serial is the top, left, and right camera. Then point
+each slot at its camera with an `orbbec://` source in the usual `*_cam_device`
+key:
 
 ```ini
-top_orbbec_serial = "YOUR-TOP-SERIAL"
-left_orbbec_serial = "YOUR-LEFT-SERIAL"
-right_orbbec_serial = "YOUR-RIGHT-SERIAL"
+top_cam_device = orbbec://YOUR-TOP-SERIAL
+left_cam_device = orbbec://YOUR-LEFT-SERIAL
+right_cam_device = orbbec://YOUR-RIGHT-SERIAL
 ```
 
-A slot with `*_orbbec_serial` is owned by pyorbbecsdk. Observations carry the
+The scheme picks what reads the slot: a V4L2 path or `http://`/`rtsp://` URL
+goes to OpenCV, `orbbec://SERIAL` to pyorbbecsdk, and `realsense://SERIAL` to
+librealsense (the same as `*_depth_serial`). An unknown scheme is rejected at
+config load.
+
+A slot with an `orbbec://` source is owned by pyorbbecsdk. Observations carry the
 same keys as a RealSense slot: the colour image in `images`, and
 `extra["{cam}_depth"]` (float32 metres, aligned to that image) plus
 `extra["{cam}_intrinsics"]` (3×3 K at the published size). Depth is aligned to
@@ -466,8 +472,8 @@ the colour sensor in software with the SDK's `AlignFilter`. The reader requests
 colour as RGB, falling back to BGR, YUYV, then MJPG, and never the Y8/Y16
 greyscale modes a Gemini colour sensor also offers; depth is requested as Y16.
 
-`*_orbbec_serial` is a third source per slot, exclusive with `*_cam_device`
-and `*_depth_serial`, and slots can mix sources. `capture_width` /
+Slots can mix sources, for example a RealSense on top and Orbbec wrists.
+`capture_width` /
 `capture_height`, the `depth_capture_*` sizes and their per-slot overrides, and
 `depth_fps` apply as they do for RealSense. Depth sizes often differ from colour
 sizes, so set `depth_capture_width` / `depth_capture_height` to a size the

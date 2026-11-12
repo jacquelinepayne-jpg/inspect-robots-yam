@@ -56,13 +56,9 @@ MIN_SETTLE_S = 0.2
 #: Argparse dests for --top-cam/--left-cam/--right-cam; also the flag-vs-``-E``
 #: conflict domain (depth serials have no flags).
 _CAMERA_FLAG_KEYS = frozenset({"top_cam_device", "left_cam_device", "right_cam_device"})
-_DEPTH_SERIAL_KEYS = frozenset(
-    f"{slot}_{suffix}"
-    for slot in ("top", "left", "right")
-    for suffix in ("depth_serial", "orbbec_serial")
-)
+_DEPTH_SERIAL_KEYS = frozenset({"top_depth_serial", "left_depth_serial", "right_depth_serial"})
 #: ``-E`` values that must never be scalar-coerced: a numeric device index or
-#: RealSense/Orbbec serial would otherwise arrive as int and traceback in validation.
+#: RealSense serial would otherwise arrive as int and traceback in validation.
 _RAW_STRING_KEYS = _CAMERA_FLAG_KEYS | _DEPTH_SERIAL_KEYS
 #: Every camera-slot key: the skip-conflict and slot-supersession domain.
 _CAMERA_SLOT_KEYS = _RAW_STRING_KEYS
@@ -199,21 +195,16 @@ def _default_write_montage(
 
 
 def _camera_devices(cfg: YamConfig) -> tuple[tuple[str, str], ...]:
-    devices = (cfg.top_cam_device, cfg.left_cam_device, cfg.right_cam_device)
-    return tuple(
-        (name, device)
-        for name, device in zip(DEFAULT_CAMERAS, devices, strict=True)
-        if device is not None
-    )
+    """Return the OpenCV-read slots (V4L2 nodes and stream URLs) this tool can check."""
+    return tuple(cfg.camera_sources("opencv").items())
 
 
 def _unchecked_depth_cameras(cfg: YamConfig) -> tuple[UncheckedCamera, ...]:
-    """Return configured RealSense and Orbbec slots that this V4L2-only tool cannot check."""
+    """Return configured depth-camera slots (RealSense, Orbbec) this tool cannot check."""
     return tuple(
         UncheckedCamera(name=name, reason=_DEPTH_UNCHECKED_REASON)
-        for name, slot in zip(DEFAULT_CAMERAS, _CAMERA_SLOTS, strict=True)
-        if getattr(cfg, f"{slot}_depth_serial") is not None
-        or getattr(cfg, f"{slot}_orbbec_serial") is not None
+        for name in DEFAULT_CAMERAS
+        if (source := cfg.camera_source(name)) is not None and source[0] != "opencv"
     )
 
 
@@ -500,7 +491,7 @@ def main(
     explicit_keys = extras.keys() | flag_values.keys()
     explicit_camera_keys = _CAMERA_SLOT_KEYS & explicit_keys
     for slot in _CAMERA_SLOTS:
-        slot_keys = {f"{slot}_cam_device", f"{slot}_depth_serial", f"{slot}_orbbec_serial"}
+        slot_keys = {f"{slot}_cam_device", f"{slot}_depth_serial"}
         if slot_keys & explicit_camera_keys:
             for key in slot_keys | {
                 f"{slot}_depth_capture_width",

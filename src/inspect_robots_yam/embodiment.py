@@ -63,6 +63,7 @@ from inspect_robots_yam.config import (
     DEFAULT_EEF_LOW,
     DEFAULT_JOINT_HOME_POSE,
     EEF_DIM_LABELS,
+    STREAM_SCHEMES,
     YamConfig,
     _redact_userinfo,
     action_box,
@@ -504,13 +505,6 @@ class _PublishedPair:
     published_s: float
 
 
-#: URL schemes a ``*_cam_device`` may carry instead of a V4L2 node. They are
-#: read through OpenCV's FFmpeg backend, so a camera hub (go2rtc's
-#: ``/api/stream.mjpeg``, an RTSP relay) can own the device and serve the eval,
-#: a live view, and a judge's stills from one capture.
-STREAM_SCHEMES: tuple[str, ...] = ("http://", "https://", "rtsp://", "rtsps://")
-
-
 def _is_stream_source(device: str) -> bool:
     """Whether ``device`` names a network stream (see ``STREAM_SCHEMES``) or a V4L2 node."""
     return device.startswith(STREAM_SCHEMES)
@@ -821,15 +815,7 @@ class _OpenCVCameraReader:
 
 def _opencv_camera_reader(cfg: YamConfig) -> CameraReader:
     """Build the builtin V4L2 reader for device-sourced camera slots."""
-    devices = {
-        name: device
-        for name, device in (
-            ("top_cam", cfg.top_cam_device),
-            ("left_cam", cfg.left_cam_device),
-            ("right_cam", cfg.right_cam_device),
-        )
-        if device is not None
-    }
+    devices = cfg.camera_sources("opencv")
     return _OpenCVCameraReader(
         devices,
         capture_size=(cfg.capture_width, cfg.capture_height),
@@ -1863,44 +1849,24 @@ class YAMEmbodiment:
         self._kinematics_factory: KinematicsFactory = (
             kinematics_factory or _default_kinematics_factory
         )
-        depth_serials = {
-            name: serial
-            for name, serial in (
-                ("top_cam", self._cfg.top_depth_serial),
-                ("left_cam", self._cfg.left_depth_serial),
-                ("right_cam", self._cfg.right_depth_serial),
-            )
-            if serial is not None
-        }
-        orbbec_serials = {
-            name: serial
-            for name, serial in (
-                ("top_cam", self._cfg.top_orbbec_serial),
-                ("left_cam", self._cfg.left_orbbec_serial),
-                ("right_cam", self._cfg.right_orbbec_serial),
-            )
-            if serial is not None
-        }
+        # One source per slot (YamConfig.camera_source): *_depth_serial or a
+        # realsense:// device goes to librealsense, orbbec:// to pyorbbecsdk,
+        # and V4L2 nodes or stream URLs to OpenCV.
+        depth_serials = self._cfg.camera_sources("realsense")
+        orbbec_serials = self._cfg.camera_sources("orbbec")
         self._builtin_realsense_reader: _RealsenseReader | None = None
         self._builtin_orbbec_reader: _OrbbecCameraReader | None = None
         if camera_reader is not None:
             if depth_serials or orbbec_serials:
                 raise ValueError(
-                    "custom camera_reader conflicts with configured *_depth_serial or "
-                    "*_orbbec_serial values: configured depth serials drive the builtin "
-                    "capture path; with a custom camera_reader, supply depth via "
-                    "depth_reader instead"
+                    "custom camera_reader conflicts with configured depth cameras "
+                    "(*_depth_serial, realsense:// or orbbec:// sources): configured depth "
+                    "serials drive the builtin capture path; with a custom camera_reader, "
+                    "supply depth via depth_reader instead"
                 )
         else:
             builtin_readers: list[CameraReader] = []
-            if any(
-                device is not None
-                for device in (
-                    self._cfg.top_cam_device,
-                    self._cfg.left_cam_device,
-                    self._cfg.right_cam_device,
-                )
-            ):
+            if self._cfg.camera_sources("opencv"):
                 builtin_readers.append(_opencv_camera_reader(self._cfg))
             if depth_serials:
                 capture_sizes = {name: self._cfg.capture_size_for(name) for name in depth_serials}
@@ -2214,9 +2180,9 @@ class YAMEmbodiment:
         if self._camera_reader is _default_camera_reader or not callable(self._camera_reader):
             raise ConfigError(
                 "yam_arms has no cameras configured. Set exactly one source per "
-                "camera slot: *_cam_device for V4L2 colour, *_depth_serial for "
-                "RealSense colour+depth, or *_orbbec_serial for Orbbec "
-                "colour+depth, in YamConfig, config.ini "
+                "camera slot in *_cam_device: a V4L2 node or stream URL for "
+                "colour, orbbec://SERIAL or realsense://SERIAL for colour+depth "
+                "(or *_depth_serial for RealSense), in YamConfig, config.ini "
                 "([embodiment.args]), or the CLI; or provide a custom "
                 "camera_reader= via the Python API."
             )

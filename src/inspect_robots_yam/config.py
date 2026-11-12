@@ -121,6 +121,49 @@ class _FromKwargs:
         return cls(**flat)
 
 
+#: URL schemes a ``*_cam_device`` may carry instead of a V4L2 node. They are
+#: read through OpenCV's FFmpeg backend, so a camera hub (go2rtc's
+#: ``/api/stream.mjpeg``, an RTSP relay) can own the device and serve the eval,
+#: a live view, and a judge's stills from one capture.
+STREAM_SCHEMES: tuple[str, ...] = ("http://", "https://", "rtsp://", "rtsps://")
+
+#: ``*_cam_device`` prefixes that name a depth camera by serial instead of a
+#: device node: the scheme picks the SDK that owns the slot. A new camera family
+#: is a new entry here, never a new config key.
+DEPTH_SCHEMES: dict[str, str] = {"realsense://": "realsense", "orbbec://": "orbbec"}
+
+#: What reads a slot: ``opencv`` (V4L2 node or stream URL), ``realsense``, ``orbbec``.
+CAMERA_BACKENDS: tuple[str, ...] = ("opencv", "realsense", "orbbec")
+
+_SCHEME_SEPARATOR = "://"
+
+
+def _depth_device(device: str | None) -> bool:
+    """Whether a ``*_cam_device`` value names a depth camera (a ``DEPTH_SCHEMES`` prefix)."""
+    return device is not None and device.startswith(tuple(DEPTH_SCHEMES))
+
+
+def parse_camera_source(device: str) -> tuple[str, str]:
+    """Split a ``*_cam_device`` value into ``(backend, locator)``.
+
+    ``orbbec://SERIAL`` and ``realsense://SERIAL`` return the SDK backend and
+    the bare serial. A V4L2 path or a ``STREAM_SCHEMES`` URL returns
+    ``("opencv", device)`` unchanged. Any other ``scheme://`` value is rejected,
+    since it would otherwise be opened as a file path and fail obscurely.
+    """
+    for prefix, backend in DEPTH_SCHEMES.items():
+        if device.startswith(prefix):
+            return backend, device[len(prefix) :]
+    if _SCHEME_SEPARATOR in device and not device.startswith(STREAM_SCHEMES):
+        supported = ", ".join((*DEPTH_SCHEMES, *STREAM_SCHEMES))
+        scheme = device.split(_SCHEME_SEPARATOR, 1)[0]
+        raise ValueError(
+            f"unsupported camera source scheme {scheme + _SCHEME_SEPARATOR!r}; "
+            f"supported: {supported}, or a V4L2 device path"
+        )
+    return "opencv", device
+
+
 @dataclass(frozen=True)
 class YamConfig(_FromKwargs):
     """Static configuration for a bimanual YAM embodiment."""
@@ -162,8 +205,8 @@ class YamConfig(_FromKwargs):
     # Per-camera overrides of the two pairs above (plan 0033). None means "use
     # the rig-wide value". A mixed rig can then run its D435 top camera at
     # 1920 x 1080 while D405 wrists stay within their 1280 x 720 maximum.
-    # Depth overrides apply only to a slot with `{slot}_depth_serial` or
-    # `{slot}_orbbec_serial`.
+    # Depth overrides apply only to a depth slot: `{slot}_depth_serial`, or a
+    # `realsense://` or `orbbec://` `{slot}_cam_device`.
     top_capture_width: int | None = None
     top_capture_height: int | None = None
     left_capture_width: int | None = None
@@ -256,12 +299,20 @@ class YamConfig(_FromKwargs):
     # that predates it). Display-only; bounds nothing. Removal in a later
     # release.
     max_steps_hint: int | None = None
-    # Builtin OpenCV camera sources: set a slot to its V4L2 color node (stable
-    # udev paths recommended; /dev/videoN reshuffles on replug) or to a stream
-    # URL (http://, https://, rtsp://, rtsps://) served by a camera hub that owns
-    # the device; URLs are read through OpenCV's FFmpeg backend.
+    # One camera source per slot; the value picks what reads it:
+    # - a V4L2 colour node (stable udev paths recommended; /dev/videoN
+    #   reshuffles on replug), read through OpenCV (base dependency);
+    # - a stream URL (http://, https://, rtsp://, rtsps://) served by a camera
+    #   hub that owns the device, read through OpenCV's FFmpeg backend;
+    # - `orbbec://SERIAL`: an Orbbec camera (Orbbec SDK v2, e.g. Gemini 300
+    #   series) owned by pyorbbecsdk, serving colour plus depth aligned to it
+    #   and the colour intrinsics. Install with
+    #   `embodiment.ORBBEC_INSTALL_COMMAND` (--no-deps: the binding's declared
+    #   dependencies clash with opencv-python-headless);
+    # - `realsense://SERIAL`: a RealSense camera, the same as setting
+    #   `{slot}_depth_serial` (see below).
     # Plain strings, so `-E top_cam_device=...` and config.ini can carry them.
-    # Uses the base opencv-python-headless dependency.
+    # See `parse_camera_source`.
     top_cam_device: str | None = None
     left_cam_device: str | None = None
     right_cam_device: str | None = None
@@ -278,19 +329,6 @@ class YamConfig(_FromKwargs):
     top_depth_serial: str | None = None
     left_depth_serial: str | None = None
     right_depth_serial: str | None = None
-    # Optional Orbbec sources (Gemini 300 series and other devices supported by
-    # Orbbec SDK v2): setting `{slot}_orbbec_serial` hands that camera slot to
-    # pyorbbecsdk, which serves its colour image plus depth aligned to that
-    # colour frame and the colour intrinsics, exactly as a RealSense slot does.
-    # It is a third mutually exclusive source for the slot. The serial is the
-    # one OrbbecViewer or `DeviceList.get_device_serial_number_by_index` reports.
-    # Capture runs in-process on one drain thread per camera. Install the
-    # binding with `embodiment.ORBBEC_INSTALL_COMMAND` (not a pip extra: its
-    # declared dependencies would clash with opencv-python-headless). Quote
-    # all-digit serials in config.ini, as for `*_depth_serial`.
-    top_orbbec_serial: str | None = None
-    left_orbbec_serial: str | None = None
-    right_orbbec_serial: str | None = None
     # Capture all configured RealSense cameras in one spawn child by default,
     # keeping librealsense and frame-copy work outside the motor-control
     # interpreter. "inline" restores the prior in-process implementation as a
@@ -330,11 +368,7 @@ class YamConfig(_FromKwargs):
                     f"{field} must be a string; quote the value in config.ini — "
                     "numeric values are int-coerced and may lose leading zeros"
                 )
-        for field in (
-            f"{slot}_{suffix}"
-            for slot in ("top", "left", "right")
-            for suffix in ("depth_serial", "orbbec_serial")
-        ):
+        for field in (f"{slot}_depth_serial" for slot in ("top", "left", "right")):
             if isinstance(flat.get(field), int):
                 raise ValueError(
                     f"{field} must be a string; quote the serial in config.ini — "
@@ -405,6 +439,32 @@ class YamConfig(_FromKwargs):
         if width is not None and height is not None:
             return (width, height)
         return self.depth_capture_size or self.capture_size_for(camera)
+
+    def camera_source(self, camera: str) -> tuple[str, str] | None:
+        """Return one camera's ``(backend, locator)``, or None when the slot is unsourced.
+
+        ``{slot}_depth_serial`` reads as ``("realsense", serial)``; a
+        ``{slot}_cam_device`` is split by ``parse_camera_source``.
+        """
+        slot = self._camera_slot(camera)
+        serial = getattr(self, f"{slot}_depth_serial")
+        if serial is not None:
+            return "realsense", serial
+        device = getattr(self, f"{slot}_cam_device")
+        return None if device is None else parse_camera_source(device)
+
+    def camera_sources(self, backend: str) -> dict[str, str]:
+        """Map each camera read by ``backend`` (see ``CAMERA_BACKENDS``) to its locator."""
+        if backend not in CAMERA_BACKENDS:
+            raise ValueError(
+                f"unknown camera backend {backend!r}; expected one of {CAMERA_BACKENDS}"
+            )
+        sources: dict[str, str] = {}
+        for camera in DEFAULT_CAMERAS:
+            source = self.camera_source(camera)
+            if source is not None and source[0] == backend:
+                sources[camera] = source[1]
+        return sources
 
     def __post_init__(self) -> None:
         """Reject values that violate the 14-D packing and hardware invariants.
@@ -562,15 +622,14 @@ class YamConfig(_FromKwargs):
                         not isinstance(value, int) or isinstance(value, bool) or value < 16
                     ):
                         raise ValueError(f"{key} must be an integer of at least 16 or unset")
-            if (
-                getattr(self, f"{slot}_depth_capture_width") is not None
-                and getattr(self, f"{slot}_depth_serial") is None
-                and getattr(self, f"{slot}_orbbec_serial") is None
+            if getattr(self, f"{slot}_depth_capture_width") is not None and not (
+                getattr(self, f"{slot}_depth_serial") is not None
+                or _depth_device(getattr(self, f"{slot}_cam_device"))
             ):
                 raise ValueError(
                     f"{slot}_depth_capture_width/height only apply to a depth slot; "
-                    f"set {slot}_depth_serial or {slot}_orbbec_serial, or remove the "
-                    f"depth override"
+                    f"set {slot}_depth_serial or a realsense:// or orbbec:// "
+                    f"{slot}_cam_device, or remove the depth override"
                 )
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
@@ -587,7 +646,7 @@ class YamConfig(_FromKwargs):
         camera_source_fields = tuple(
             f"{slot}_{suffix}"
             for slot in ("top", "left", "right")
-            for suffix in ("cam_device", "depth_serial", "orbbec_serial")
+            for suffix in ("cam_device", "depth_serial")
         )
         for field in camera_source_fields:
             value = getattr(self, field)
@@ -606,20 +665,26 @@ class YamConfig(_FromKwargs):
                     f"{_redact_userinfo(device)!r}"
                 )
             cam_device_fields[device] = field
-        for suffix in ("depth_serial", "orbbec_serial"):
-            serial_fields: dict[str, str] = {}
-            for slot in ("top", "left", "right"):
-                field = f"{slot}_{suffix}"
-                serial = getattr(self, field)
-                if serial is None:
-                    continue
-                previous = serial_fields.get(serial)
-                if previous is not None:
-                    raise ValueError(
-                        f"{previous} and {field} must be different; duplicate "
-                        f"{suffix.replace('_', ' ')} {serial!r}"
-                    )
-                serial_fields[serial] = field
+        depth_serial_fields: dict[str, str] = {}
+        for slot in ("top", "left", "right"):
+            field = f"{slot}_depth_serial"
+            serial = getattr(self, field)
+            if serial is None:
+                continue
+            previous = depth_serial_fields.get(serial)
+            if previous is not None:
+                raise ValueError(
+                    f"{previous} and {field} must be different; duplicate depth serial {serial!r}"
+                )
+            depth_serial_fields[serial] = field
+        for slot in ("top", "left", "right"):
+            field = f"{slot}_cam_device"
+            device = getattr(self, field)
+            if device is None:
+                continue
+            backend, locator = parse_camera_source(device)
+            if backend != "opencv" and not locator.strip():
+                raise ValueError(f"{field} {device!r} names no camera serial")
         for slot in ("top", "left", "right"):
             if getattr(self, f"{slot}_cam_device") is not None and (
                 getattr(self, f"{slot}_depth_serial") is not None
@@ -629,24 +694,20 @@ class YamConfig(_FromKwargs):
                     f"exclusive: a RealSense camera opened through librealsense "
                     f"cannot also be opened through V4L2 (one streamer per node)"
                 )
-            configured = [
-                f"{slot}_{suffix}"
-                for suffix in ("cam_device", "depth_serial", "orbbec_serial")
-                if getattr(self, f"{slot}_{suffix}") is not None
-            ]
-            if f"{slot}_orbbec_serial" in configured and len(configured) > 1:
-                raise ValueError(
-                    f"{' and '.join(configured)} are mutually exclusive: each camera "
-                    f"slot takes one source, and an Orbbec camera opened through "
-                    f"pyorbbecsdk cannot also be opened another way"
-                )
+        for backend in ("realsense", "orbbec"):
+            owners: dict[str, str] = {}
+            for camera, serial in self.camera_sources(backend).items():
+                if serial in owners:
+                    raise ValueError(
+                        f"{owners[serial]} and {camera} both use {backend} camera "
+                        f"{serial!r}; give each slot a different camera"
+                    )
+                owners[serial] = camera
         sourced = {
             slot
             for slot in ("top", "left", "right")
-            if any(
-                getattr(self, f"{slot}_{suffix}") is not None
-                for suffix in ("cam_device", "depth_serial", "orbbec_serial")
-            )
+            if getattr(self, f"{slot}_cam_device") is not None
+            or getattr(self, f"{slot}_depth_serial") is not None
         }
         if sourced and len(sourced) != 3:
             unsourced = ", ".join(slot for slot in ("top", "left", "right") if slot not in sourced)

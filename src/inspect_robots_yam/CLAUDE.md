@@ -49,6 +49,12 @@ The package is `mypy --strict` clean, ships `py.typed`, and is 100%-covered.
   views are per-read copies and must be discarded before close. Keep
   `realsense_capture="inline"` behaviorally equivalent as the debugging escape
   hatch.
+- **One source per slot, chosen by the value:** `config.parse_camera_source`
+  maps a `*_cam_device` to `opencv` (V4L2 path or `STREAM_SCHEMES` URL),
+  `realsense` or `orbbec` (`DEPTH_SCHEMES`); `*_depth_serial` reads as
+  `realsense`. Use `YamConfig.camera_source` / `camera_sources(backend)`,
+  never the raw fields, to decide which reader owns a slot. A new camera
+  family is a new scheme, not new keys.
 - **Orbbec capture is in-process:** `_OrbbecCameraReader` subclasses the
   inline `_RealsenseCameraReader`, reusing its frame slots, staleness checks,
   intrinsics scaling, lazy depth thunks and close discipline, and replaces only

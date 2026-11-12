@@ -7,7 +7,7 @@ first (``--no-deps`` keeps its example-app dependencies off the rig):
     uv pip install --no-deps 'pyorbbecsdk2>=2.1.3'
     python scripts/orbbec_probe.py
 
-For every device it prints the serial to put in ``{slot}_orbbec_serial``, every
+For every device it prints the serial for ``{slot}_cam_device = orbbec://SERIAL``, every
 sensor the device exposes, and the colour and depth profiles it offers. A device
 without a ``COLOR_SENSOR`` (one that exposes only a left/right colour pair) is
 flagged: the builtin reader cannot align depth to it yet.

@@ -27,9 +27,6 @@ _YAM_DEVICE_KEYS = frozenset(
         "top_depth_serial",
         "left_depth_serial",
         "right_depth_serial",
-        "top_orbbec_serial",
-        "left_orbbec_serial",
-        "right_orbbec_serial",
         "left_channel",
         "right_channel",
     }
